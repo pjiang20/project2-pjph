@@ -7,6 +7,7 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 import time
 import hashlib
+from threading import Timer
 # GLOBAL VARIABLES
 # set both initial sequence numbers to 0
 # RECV_SEQNUM, so far, keeps track of the expected seqnum of next received packet.
@@ -44,9 +45,22 @@ class Streamer:
         sequence_number = SEND_SEQNUM
         update_seq = self.send_data(sequence_number,data_bytes)
 
-        # wait for ACK
+        # wait for ACK; Replace with selective repeat
         # Add timeout
+        # Timer(0.25, self.selective_repeat, [sequence_number, data_bytes]).start()
         timer = time.time()
+        update_seq = self.time_out_loop(timer,update_seq, sequence_number, data_bytes)
+        SEND_SEQNUM = update_seq
+    
+    def selective_repeat(self, sequence_number, data_bytes):
+        if self.closed:
+            return
+        if sequence_number in self.ack_queue:
+            self.send_data(sequence_number, data_bytes)
+
+
+    
+    def time_out_loop(self, timer,update_seq, sequence_number, data_bytes):
         while not self.ack:
             if time.time() - timer > 0.25:
                 # print("timeout", self.ack_queue)
@@ -55,7 +69,8 @@ class Streamer:
                 timer = time.time()
             time.sleep(0.01)
         self.ack = False
-        SEND_SEQNUM = update_seq
+
+        return update_seq
     
     def send_data(self, sequence_num, data_bytes):
 
@@ -121,18 +136,6 @@ class Streamer:
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
         global RECV_SEQNUM
-
-        # helper method to receive and unpack/parse a packet
-        # def recv_helper():
-            
-        #     data = self.receive_buffer[RECV_SEQNUM]
-        #     self.receive_buffer.pop(RECV_SEQNUM)
-        #     # unpack the headers in the packet (data)
-        #     # (var,) format is used because struct.unpack returns a tuple
-        #     (data_seqnum,) = struct.unpack("I", data[:4])
-        #     (content_length,) = struct.unpack("I", data[4:8])
-        #     (content,) = struct.unpack("%ds" % content_length, data[HEADER_LENGTH:])
-        #     return data_seqnum, content_length, content
         while True:
             if RECV_SEQNUM in self.receive_buffer:
                 # initial call to recv_helper to receive the next packet in the stream
@@ -142,24 +145,13 @@ class Streamer:
                 # unpack the headers in the packet (data)
                 data_seqnum, content_length, is_ack, is_fin, content_hash, content = self.unpack_packet(data)
 
-                # # debugging
-                # print("packet seqnum: " + str(data_seqnum))
-                # print("content length: " + str(content_length))
-
-                # as long as out of order (later) packets are being received, keep storing them in
-                # the buffer and taking in the next packet in the stream using recv_helper
-                # while data_seqnum != RECV_SEQNUM:
-                #     OOO_BUFFER.append((data_seqnum, content_length, content))
-                #     OOO_BUFFER.sort()
-                #     data_seqnum, content_length, content = recv_helper()
-
                 # once the right packet has been received, update RECV_SEQNUM
                 RECV_SEQNUM += content_length + HEADER_LENGTH
                 # keep popping Out-Of-Order buffer to retrieve any consecutive packets until up-to-date
-                # while len(OOO_BUFFER) > 0 and OOO_BUFFER[0][0] == RECV_SEQNUM:
-                #     dsq, cl, c = OOO_BUFFER.pop(0)
-                #     content += c
-                #     RECV_SEQNUM += cl + HEADER_LENGTH
+                while len(OOO_BUFFER) > 0 and OOO_BUFFER[0][0] == RECV_SEQNUM:
+                    dsq, cl, a, f, ch, c = OOO_BUFFER.pop(0)
+                    content += c
+                    RECV_SEQNUM += cl + HEADER_LENGTH
                 return content
             else:
                 continue
@@ -201,22 +193,27 @@ class Streamer:
 
                 if len(data) == 0:
                     continue
+
                 data_seqnum, content_length, is_ack, is_fin, content_hash, content = self.unpack_packet(data)
 
                 # hash test
                 if content_hash != self.hash_md5(content):
                     continue
 
-                if is_ack and data_seqnum in self.ack_queue:
-                    self.ack = True
-                    # print("ack received for", data_seqnum)
-                    self.ack_queue.remove(data_seqnum)
+                if is_ack:
+                    if data_seqnum in self.ack_queue:
+                        self.ack = True
+                        # print("ack received for", data_seqnum)
+                        self.ack_queue.remove(data_seqnum)
                 elif is_fin:
                     # send ACK for FIN
                     fin_data = self.create_packet(0, data_seqnum, True, False, b'')
                     self.socket.sendto(fin_data, (self.dst_ip, self.dst_port))
                 else:
                     self.receive_buffer[data_seqnum] = data
+                    if data_seqnum != RECV_SEQNUM:
+                        OOO_BUFFER.append((data_seqnum, content_length, is_ack, is_fin, content_hash, content))
+                        OOO_BUFFER.sort()        
                     self.socket.sendto(self.create_packet(0, data_seqnum, True, False, b''), (self.dst_ip, self.dst_port))
 
             except Exception as e:
