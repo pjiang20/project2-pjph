@@ -7,6 +7,7 @@ from lossy_socket import LossyUDP
 from socket import INADDR_ANY
 # other libraries
 import struct
+import hashlib
 
 # GLOBAL VARIABLES
 # set both initial sequence numbers to 0
@@ -17,7 +18,7 @@ RECV_SEQNUM = 0
 OOO_BUFFER = []
 # 4 bytes needed for sequence number, 4 bytes needed for content length
 # change value as needed later for additional headers
-HEADER_LENGTH = 10
+HEADER_LENGTH = 26
 
 
 class Streamer:
@@ -49,9 +50,12 @@ class Streamer:
             data_bytes = data_bytes[max_packet_size:]
 
             # struct docs: https://docs.python.org/3/library/struct.html
-            # use struct to pack in sequence number, content length, and content
+            # use struct to pack in sequence number, content length, isAck, isFin, and content
             curr_seqnum = SEND_SEQNUM
-            data = struct.pack("II??%ds" % max_packet_size, SEND_SEQNUM, max_packet_size, False, False, content)
+            data_to_hash = struct.pack("II??%ds" % max_packet_size, SEND_SEQNUM, max_packet_size, False, False, content)
+            data = struct.pack("II??16s%ds" % max_packet_size, SEND_SEQNUM, max_packet_size, False, False,
+                               self.hash_md5(data_to_hash), content)
+
             # increment sequence number by the appropriate amount
             SEND_SEQNUM += max_packet_size + HEADER_LENGTH
 
@@ -62,7 +66,9 @@ class Streamer:
 
         if len(data_bytes) > 0:
             curr_seqnum = SEND_SEQNUM
-            data = struct.pack("II??%ds" % len(data_bytes), SEND_SEQNUM, len(data_bytes), False, False, data_bytes)
+            data_to_hash = struct.pack("II??%ds" % len(data_bytes), SEND_SEQNUM, len(data_bytes), False, False, data_bytes)
+            data = struct.pack("II??16s%ds" % len(data_bytes), SEND_SEQNUM, len(data_bytes), False, False,
+                               self.hash_md5(data_to_hash), data_bytes)
             SEND_SEQNUM += len(data_bytes) + HEADER_LENGTH
             self.socket.sendto(data, (self.dst_ip, self.dst_port))
             self.seq_ack_status[curr_seqnum] = False
@@ -70,6 +76,13 @@ class Streamer:
             self.wait_for_ack(curr_seqnum, data)
     
     # def send_data
+
+    def hash_md5(self, data):
+        # create hash of the content
+        m = hashlib.md5()
+        m.update(data)
+        content_hash = m.digest()
+        return content_hash
     
     def wait_for_ack(self, seqnum, data):
         # Add a timeout to the wait for ack
@@ -98,12 +111,13 @@ class Streamer:
             (content_length,) = struct.unpack("I", data[4:8])
             (is_ack,) = struct.unpack("?", data[8:9])
             (is_fin,) = struct.unpack("?", data[9:10])
+            (content_hash,) = struct.unpack("16s", data[10:26])
             (content,) = struct.unpack("%ds" % content_length, data[HEADER_LENGTH:])
-            return data_seqnum, content_length, is_ack, is_fin, content
+            return data_seqnum, content_length, is_ack, is_fin, content_hash, content
         while True:
             if RECV_SEQNUM in self.receive_buffer:
             # initial call to recv_helper to receive the next packet in the stream
-                data_seqnum, content_length, is_ack, is_fin, content = recv_helper()
+                data_seqnum, content_length, is_ack, is_fin, content_hash, content = recv_helper()
 
                 # # debugging
                 # print("packet seqnum: " + str(data_seqnum))
@@ -114,7 +128,7 @@ class Streamer:
                 while data_seqnum != RECV_SEQNUM:
                     OOO_BUFFER.append((data_seqnum, content_length, content))
                     OOO_BUFFER.sort()
-                    data_seqnum, content_length, is_ack, is_fin, content = recv_helper()
+                    data_seqnum, content_length, is_ack, is_fin, content_hash, content = recv_helper()
 
                 # once the right packet has been received, update RECV_SEQNUM
                 RECV_SEQNUM += content_length + HEADER_LENGTH
@@ -139,7 +153,9 @@ class Streamer:
 
         # send a final packet
         content = b'1'
-        data = struct.pack("II??%ds" % len(content), SEND_SEQNUM, len(content), False, True, content)
+        data_to_hash = struct.pack("II??%ds" % len(content), SEND_SEQNUM, len(content), False, True, content)
+        data = struct.pack("II??16s%ds" % len(content), SEND_SEQNUM, len(content), False, True,
+                           self.hash_md5(data_to_hash), content)
         self.socket.sendto(data, (self.dst_ip, self.dst_port))
 
         # wait for the final ack; with a timeout
@@ -163,8 +179,9 @@ class Streamer:
         (content_length,) = struct.unpack("I", data[4:8])
         (is_ack,) = struct.unpack("?", data[8:9])
         (is_fin,) = struct.unpack("?", data[9:10])
+        (content_hash, ) = struct.unpack("16s", data[10:26])
         (content,) = struct.unpack("%ds" % content_length, data[HEADER_LENGTH:])
-        return data_seqnum, content_length, is_ack, is_fin, content
+        return data_seqnum, content_length, is_ack, is_fin, content_hash, content
 
     def listener(self) -> None:
         """Listens for incoming packets, and prints them out to the console."""
@@ -174,14 +191,22 @@ class Streamer:
 
                 if len(data) == 0:
                     continue
-                data_seqnum, content_length, is_ack, is_fin, content = self.unpack(data)
+
+                data_seqnum, content_length, is_ack, is_fin, content_hash, content = self.unpack(data)
+
+                # hash test
+                if content_hash != self.hash_md5(struct.pack("II??%ds" % content_length, data_seqnum,
+                                                             content_length, is_ack, is_fin, content)):
+                    continue
 
                 fin_ack_content = b'1'
 
                 if is_ack and is_fin:
                     self.fin_received = True
                 elif is_fin:
-                    data = struct.pack("II??%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, True, fin_ack_content)
+                    data_to_hash = struct.pack("II??%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, True,fin_ack_content)
+                    data = struct.pack("II??16s%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, True,
+                                       self.hash_md5(data_to_hash), fin_ack_content)
                     self.socket.sendto(data, (self.dst_ip, self.dst_port))
                 elif is_ack:
                     self.seq_ack_status[data_seqnum] = True
@@ -190,12 +215,11 @@ class Streamer:
                     self.receive_buffer[data_seqnum] = data
                     # send an ACK back to the sender
                     print("sending ack for seqnum: " + str(data_seqnum))
-                    ack = struct.pack("II??%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, False, fin_ack_content)
+                    data_to_hash = struct.pack("II??%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, False, fin_ack_content)
+                    ack = struct.pack("II??16s%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, False,
+                                      self.hash_md5(data_to_hash), fin_ack_content)
                     self.socket.sendto(ack, (self.dst_ip, self.dst_port))
             
             except Exception as e:
                 print("listener died!")
                 print(e)
-        
-
-            
