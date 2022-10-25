@@ -1,6 +1,5 @@
 # do not import anything else from loss_socket besides LossyUDP
 from concurrent.futures import ThreadPoolExecutor
-from operator import is_
 import time
 from lossy_socket import LossyUDP
 # do not import anything else from socket except INADDR_ANY
@@ -8,6 +7,8 @@ from socket import INADDR_ANY
 # other libraries
 import struct
 import hashlib
+from threading import Lock
+from threading import Timer
 
 # GLOBAL VARIABLES
 # set both initial sequence numbers to 0
@@ -36,6 +37,9 @@ class Streamer:
         self.seq_ack_status = {}
         self.fin_received = False
 
+        # thread lock
+        self.lock = Lock()
+
         # start the listener thread
         executer = ThreadPoolExecutor(max_workers=1)
         executer.submit(self.listener)
@@ -62,7 +66,8 @@ class Streamer:
             self.socket.sendto(data, (self.dst_ip, self.dst_port))
             self.seq_ack_status[curr_seqnum] = False
             # print("sent packet with seqnum: " + str(curr_seqnum))
-            self.wait_for_ack(curr_seqnum, data)
+            # self.wait_for_ack(curr_seqnum, data)
+            self.wait_for_ack_thread(curr_seqnum, data)
 
         if len(data_bytes) > 0:
             curr_seqnum = SEND_SEQNUM
@@ -73,7 +78,8 @@ class Streamer:
             self.socket.sendto(data, (self.dst_ip, self.dst_port))
             self.seq_ack_status[curr_seqnum] = False
             # print("sent packet with seqnum: " + str(curr_seqnum))
-            self.wait_for_ack(curr_seqnum, data)
+            # self.wait_for_ack(curr_seqnum, data)
+            self.wait_for_ack_thread(curr_seqnum, data)
     
     # def send_data
 
@@ -83,13 +89,37 @@ class Streamer:
         m.update(data)
         content_hash = m.digest()
         return content_hash
+
+    def wait_for_ack_thread(self, seqnum, data):
+        # start a thread to retranmit the packet if no ack is received
+        # with self.lock:
+        # print("waiting for ack", self.seq_ack_status)
+        t = Timer(0.25, self.retransmit, [seqnum, data])
+        t.start()
+    
+    def retransmit(self, seqnum, data):
+        # check if the packet is ACKed
+        if self.closed:
+            return
+
+        if self.seq_ack_status[seqnum]:
+            # print("packet with seqnum: " + str(seqnum) + " is ACKed")
+            del self.seq_ack_status[seqnum]
+        else:
+            # print("packet with seqnum: " + str(seqnum) + " is not ACKed")
+            try: 
+                self.socket.sendto(data, (self.dst_ip, self.dst_port))
+            except Exception as e:
+                print(e)
+            else:
+                self.wait_for_ack_thread(seqnum, data)
     
     def wait_for_ack(self, seqnum, data):
         # Add a timeout to the wait for ack
         start_time = time.time()
         while not self.seq_ack_status or not self.seq_ack_status[seqnum]:
             # print("waiting for ack", curr_seqnum)
-            if time.time() - start_time > 0.5:
+            if time.time() - start_time > 0.25:
                 self.socket.sendto(data, (self.dst_ip, self.dst_port))
                 start_time = time.time()
             time.sleep(0.01)
@@ -148,7 +178,7 @@ class Streamer:
         # your code goes here, especially after you add ACKs and retransmissions.
 
         # wait for all packets to be acked
-        while self.seq_ack_status:
+        while len(self.seq_ack_status) > 0:
             time.sleep(0.01)
 
         # send a final packet
@@ -182,6 +212,13 @@ class Streamer:
         (content_hash, ) = struct.unpack("16s", data[10:26])
         (content,) = struct.unpack("%ds" % content_length, data[HEADER_LENGTH:])
         return data_seqnum, content_length, is_ack, is_fin, content_hash, content
+    
+    def send_ack(self, data_seqnum, fin_ack_content):
+        # print("sending ack for seqnum: " + str(data_seqnum))
+        data_to_hash = struct.pack("II??%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, False, fin_ack_content)
+        ack = struct.pack("II??16s%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, False,
+                        self.hash_md5(data_to_hash), fin_ack_content)
+        self.socket.sendto(ack, (self.dst_ip, self.dst_port))
 
     def listener(self) -> None:
         """Listens for incoming packets, and prints them out to the console."""
@@ -194,12 +231,17 @@ class Streamer:
 
                 data_seqnum, content_length, is_ack, is_fin, content_hash, content = self.unpack(data)
 
+                if content == b'':
+                    continue
+
                 # hash test
                 if content_hash != self.hash_md5(struct.pack("II??%ds" % content_length, data_seqnum,
                                                              content_length, is_ack, is_fin, content)):
                     continue
 
                 fin_ack_content = b'1'
+
+                # print("received packet seqnum: ", data_seqnum, "content length: ", content_length, "is_ack: ", is_ack, "is_fin: ", is_fin, "content: ", content)
 
                 if is_ack and is_fin:
                     self.fin_received = True
@@ -208,17 +250,19 @@ class Streamer:
                     data = struct.pack("II??16s%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, True,
                                        self.hash_md5(data_to_hash), fin_ack_content)
                     self.socket.sendto(data, (self.dst_ip, self.dst_port))
-                elif is_ack:
+                elif is_ack and data_seqnum in self.seq_ack_status:
                     self.seq_ack_status[data_seqnum] = True
                 else:
                     # save the packet in the receive buffer
                     self.receive_buffer[data_seqnum] = data
                     # send an ACK back to the sender
-                    print("sending ack for seqnum: " + str(data_seqnum))
-                    data_to_hash = struct.pack("II??%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, False, fin_ack_content)
-                    ack = struct.pack("II??16s%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, False,
-                                      self.hash_md5(data_to_hash), fin_ack_content)
-                    self.socket.sendto(ack, (self.dst_ip, self.dst_port))
+                    # def send_ack():
+                    #     # print("sending ack for seqnum: " + str(data_seqnum))
+                    #     data_to_hash = struct.pack("II??%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, False, fin_ack_content)
+                    #     ack = struct.pack("II??16s%ds" % len(fin_ack_content), data_seqnum, len(fin_ack_content), True, False,
+                    #                     self.hash_md5(data_to_hash), fin_ack_content)
+                    #     self.socket.sendto(ack, (self.dst_ip, self.dst_port))
+                    Timer(0.05, self.send_ack, args=(data_seqnum, fin_ack_content)).start()
             
             except Exception as e:
                 print("listener died!")
